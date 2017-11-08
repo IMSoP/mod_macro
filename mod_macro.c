@@ -127,6 +127,7 @@ typedef struct {
   apr_array_header_t * arguments; /* of char* */
   apr_array_header_t * contents;
   char * location;        /* of the macro definition. */
+  int zombie;   /* Set to 1 by UndefMacro to allow silent overwrites */
 } macro_t;
 
 /* configuration tokens.
@@ -134,6 +135,7 @@ typedef struct {
 #define BEGIN_MACRO "<Macro"
 #define END_MACRO "</Macro>"
 #define USE_MACRO "Use"
+#define UNDEF_MACRO "UndefMacro"
 
 #define empty_string_p(p) (!(p) || *(p) == '\0')
 
@@ -766,12 +768,14 @@ static const char *macro_section(
   old = get_macro_by_name(all_macros, name);
   if (old) {
 #if !defined(MOD_MACRO_NO_WARNINGS)
-    /* already define: warn about the redefinition. */
-    ap_log_error(APLOG_MARK, APLOG_NOERRNO|APLOG_WARNING, 0, NULL,
+    if (!old->zombie) {
+        /* already defined, and not a zombie: warn about the redefinition. */
+        ap_log_error(APLOG_MARK, APLOG_NOERRNO|APLOG_WARNING, 0, NULL,
                  "macro '%s' multiply defined. "
                  "%s, redefined on line %d of %s",
                  old->name, old->location,
                  cmd->config_file->line_number, cmd->config_file->name);
+    }
 #endif
     macro = old;
   }
@@ -779,6 +783,7 @@ static const char *macro_section(
     macro = (macro_t *)apr_palloc(cmd->temp_pool, sizeof(macro_t));
   }
 
+  macro->zombie = 0;
   macro->name = name;
   debug(fprintf(stderr, "macro_section: name=%s\n", name));
 
@@ -853,7 +858,7 @@ static const char * use_macro(cmd_parms * cmd, void * dummy, const char * arg)
 
   macro = get_macro_by_name(all_macros, name);
 
-  if (!macro) {
+  if (!macro || macro->zombie) {
     return apr_psprintf(cmd->temp_pool, "macro '%s' is not defined", name);
   }
 
@@ -906,6 +911,33 @@ static const char * use_macro(cmd_parms * cmd, void * dummy, const char * arg)
   return NULL;
 }
 
+/**
+ * Hacky support for UndefMacro: finds the macro, and marks it as a zombie
+ */
+static const char * undef_macro(cmd_parms * cmd, void * dummy, const char * arg)
+{
+  char * name;
+  macro_t * macro;
+
+  macro_init(cmd->temp_pool); /* lazy... */
+
+  name = ap_getword_conf(cmd->temp_pool, &arg);
+
+  if (empty_string_p(name)) {
+    return "no macro name specified in " UNDEF_MACRO;
+  }
+
+  macro = get_macro_by_name(all_macros, name);
+
+  if (!macro || macro->zombie) {
+    return apr_psprintf(cmd->temp_pool, "macro '%s' is not defined", name);
+  }
+
+  macro->zombie = 1;
+
+  return NULL;
+}
+
 /************************************ ERROR AND WARNING DURING CONFIGURATION */
 
 /* maybe ConfigurationError and ConfigurationWarning could be used?
@@ -953,6 +985,8 @@ static const command_rec macro_cmds[] =
        "Beginning of a macro definition section."),
   AP_INIT_RAW_ARGS(USE_MACRO, use_macro, NULL, EXEC_ON_READ | OR_ALL,
        "Use of a macro."),
+  AP_INIT_RAW_ARGS(UNDEF_MACRO, undef_macro, NULL, EXEC_ON_READ | OR_ALL,
+       "Remove a macro definition."),
 
   /* configuration errors and warnings.
    */
